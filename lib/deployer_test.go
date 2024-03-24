@@ -1,4 +1,4 @@
-// Copyright © 2018 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
+// Copyright © 2022 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
@@ -16,15 +16,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	qt "github.com/frankban/quicktest"
 )
 
-var (
-	_ remoteStore = (*testStore)(nil)
-)
+var _ remoteStore = (*testStore)(nil)
 
 func TestDeploy(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	store, m := newTestStore(0, "")
 	source := testSourcePath()
 	configFile := filepath.Join(source, ".s3deploy.yml")
@@ -34,27 +32,26 @@ func TestDeploy(t *testing.T) {
 		RegionName: "eu-west-1",
 		ConfigFile: configFile,
 		MaxDelete:  300,
-		PublicReadACL: true,
+		ACL:        "public-read",
 		Silent:     true,
 		SourcePath: source,
 		baseStore:  store,
 	}
 
 	stats, err := Deploy(cfg)
-	assert.NoError(err)
-	assert.Equal("Deleted 1 of 1, uploaded 3, skipped 1 (80% changed)", stats.Summary())
+	c.Assert(err, qt.IsNil)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 1 of 1, uploaded 3, skipped 1 (80% changed)")
 	assertKeys(t, m, ".s3deploy.yml", "main.css", "index.html", "ab.txt")
 
 	mainCss := m["main.css"]
-	assert.IsType(&osFile{}, mainCss)
+	c.Assert(mainCss.(*osFile).ContentType(), qt.Equals, "text/css; charset=utf-8")
 	headers := mainCss.(*osFile).Headers()
-	assert.Equal("gzip", headers["Content-Encoding"])
-	assert.Equal("text/css; charset=utf-8", headers["Content-Type"])
-	assert.Equal("max-age=630720000, no-transform, public", headers["Cache-Control"])
+	c.Assert(headers["Content-Encoding"], qt.Equals, "gzip")
+	c.Assert(headers["Cache-Control"], qt.Equals, "max-age=630720000, no-transform, public")
 }
 
 func TestDeployWithBucketPath(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	root := "my/path"
 	store, m := newTestStore(0, root)
 	source := testSourcePath()
@@ -72,19 +69,17 @@ func TestDeployWithBucketPath(t *testing.T) {
 	}
 
 	stats, err := Deploy(cfg)
-	assert.NoError(err)
-	assert.Equal("Deleted 1 of 1, uploaded 3, skipped 1 (80% changed)", stats.Summary())
+	c.Assert(err, qt.IsNil)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 1 of 1, uploaded 3, skipped 1 (80% changed)")
 	assertKeys(t, m, "my/path/.s3deploy.yml", "my/path/main.css", "my/path/index.html", "my/path/ab.txt")
 	mainCss := m["my/path/main.css"]
-	assert.IsType(&osFile{}, mainCss)
-	assert.Equal("my/path/main.css", mainCss.(*osFile).Key())
+	c.Assert(mainCss.(*osFile).Key(), qt.Equals, "my/path/main.css")
 	headers := mainCss.(*osFile).Headers()
-	assert.Equal("gzip", headers["Content-Encoding"])
-
+	c.Assert(headers["Content-Encoding"], qt.Equals, "gzip")
 }
 
 func TestDeployForce(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	store, _ := newTestStore(0, "")
 	source := testSourcePath()
 
@@ -99,12 +94,88 @@ func TestDeployForce(t *testing.T) {
 	}
 
 	stats, err := Deploy(cfg)
-	assert.NoError(err)
-	assert.Equal("Deleted 1 of 1, uploaded 4, skipped 0 (100% changed)", stats.Summary())
+	c.Assert(err, qt.IsNil)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 1 of 1, uploaded 4, skipped 0 (100% changed)")
+}
+
+func TestDeployWitIgnorePattern(t *testing.T) {
+	c := qt.New(t)
+	root := "my/path"
+	re := `^(main\.css|deleteme\.txt)$`
+
+	store, m := newTestStore(0, root)
+	source := testSourcePath()
+	configFile := filepath.Join(source, ".s3deploy.yml")
+
+	cfg := &Config{
+		BucketName: "example.com",
+		RegionName: "eu-west-1",
+		ConfigFile: configFile,
+		BucketPath: root,
+		MaxDelete:  300,
+		Silent:     false,
+		SourcePath: source,
+		baseStore:  store,
+		Ignore:     re,
+	}
+
+	prevCss := m["my/path/main.css"]
+	prevTag := prevCss.ETag()
+
+	stats, err := Deploy(cfg)
+	c.Assert(err, qt.IsNil)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 0 of 0, uploaded 2, skipped 1 (67% changed)")
+	assertKeys(t, m,
+		"my/path/.s3deploy.yml",
+		"my/path/index.html",
+		"my/path/ab.txt",
+		"my/path/deleteme.txt", // ignored: stale
+		"my/path/main.css",     // ignored: not updated
+	)
+	mainCss := m["my/path/main.css"]
+	c.Assert(prevTag, qt.Equals, mainCss.ETag())
+}
+
+func TestDeployWitRoutesIgnore(t *testing.T) {
+	c := qt.New(t)
+	root := "my/path"
+
+	store, m := newTestStore(0, root)
+	source := testSourcePath()
+	configFile := filepath.Join(source, ".hidden/.s3deploy.ignore.yml")
+
+	cfg := &Config{
+		BucketName: "example.com",
+		RegionName: "eu-west-1",
+		ConfigFile: configFile,
+		BucketPath: root,
+		MaxDelete:  300,
+		Silent:     false,
+		SourcePath: source,
+		baseStore:  store,
+	}
+
+	// same as TestDeployWitIgnorePattern
+
+	prevCss := m["my/path/main.css"]
+	prevTag := prevCss.ETag()
+
+	stats, err := Deploy(cfg)
+	c.Assert(err, qt.IsNil)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 0 of 0, uploaded 2, skipped 1 (67% changed)")
+	assertKeys(t, m,
+		"my/path/.s3deploy.yml",
+		"my/path/index.html",
+		"my/path/ab.txt",
+		"my/path/deleteme.txt", // ignored: stale
+		"my/path/main.css",     // ignored: not updated
+	)
+	mainCss := m["my/path/main.css"]
+	c.Assert(prevTag, qt.Equals, mainCss.ETag())
 }
 
 func TestDeploySourceNotFound(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	store, _ := newTestStore(0, "")
 	wd, _ := os.Getwd()
 	source := filepath.Join(wd, "thisdoesnotexist")
@@ -119,14 +190,13 @@ func TestDeploySourceNotFound(t *testing.T) {
 	}
 
 	stats, err := Deploy(cfg)
-	assert.Error(err)
-	assert.Contains(err.Error(), "thisdoesnotexist")
-	assert.Contains(stats.Summary(), "Deleted 0 of 0, uploaded 0, skipped 0")
-
+	c.Assert(err, qt.IsNotNil)
+	c.Assert(err.Error(), qt.Contains, "thisdoesnotexist")
+	c.Assert(stats.Summary(), qt.Contains, "Deleted 0 of 0, uploaded 0, skipped 0")
 }
 
 func TestDeployInvalidSourcePath(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	store, _ := newTestStore(0, "")
 	root := "/"
 
@@ -144,21 +214,20 @@ func TestDeployInvalidSourcePath(t *testing.T) {
 	}
 
 	stats, err := Deploy(cfg)
-	assert.Error(err)
-	assert.Contains(err.Error(), "invalid source path")
-	assert.Contains(stats.Summary(), "Deleted 0 of 0, uploaded 0, skipped 0")
-
+	c.Assert(err, qt.IsNotNil)
+	c.Assert(err.Error(), qt.Contains, "invalid source path")
+	c.Assert(stats.Summary(), qt.Contains, "Deleted 0 of 0, uploaded 0, skipped 0")
 }
 
 func TestDeployNoBucket(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 	_, err := Deploy(&Config{Silent: true})
-	assert.Error(err)
+	c.Assert(err, qt.IsNotNil)
 }
 
 func TestDeployStoreFailures(t *testing.T) {
 	for i := 1; i <= 3; i++ {
-		assert := require.New(t)
+		c := qt.New(t)
 
 		store, _ := newTestStore(i, "")
 		source := testSourcePath()
@@ -175,19 +244,19 @@ func TestDeployStoreFailures(t *testing.T) {
 		message := fmt.Sprintf("Failure %d", i)
 
 		stats, err := Deploy(cfg)
-		assert.Error(err)
+		c.Assert(err, qt.IsNotNil)
 
 		if i == 3 {
 			// Fail delete step
-			assert.Contains(stats.Summary(), "Deleted 0 of 0, uploaded 3", message)
+			c.Assert(stats.Summary(), qt.Contains, "Deleted 0 of 0, uploaded 3", qt.Commentf(message))
 		} else {
-			assert.Contains(stats.Summary(), "Deleted 0 of 0, uploaded 0", message)
+			c.Assert(stats.Summary(), qt.Contains, "Deleted 0 of 0, uploaded 0", qt.Commentf(message))
 		}
 	}
 }
 
 func TestDeployMaxDelete(t *testing.T) {
-	assert := require.New(t)
+	c := qt.New(t)
 
 	m := make(map[string]file)
 
@@ -207,10 +276,9 @@ func TestDeployMaxDelete(t *testing.T) {
 	}
 
 	stats, err := Deploy(cfg)
-	assert.NoError(err)
-	assert.Equal(158+4, len(m))
-	assert.Equal("Deleted 42 of 200, uploaded 4, skipped 0 (100% changed)", stats.Summary())
-
+	c.Assert(err, qt.IsNil)
+	c.Assert(len(m), qt.Equals, 158+4)
+	c.Assert(stats.Summary(), qt.Equals, "Deleted 42 of 200, uploaded 4, skipped 0 (100% changed)")
 }
 
 func testSourcePath() string {
@@ -220,7 +288,7 @@ func testSourcePath() string {
 
 func newTestStore(failAt int, root string) (remoteStore, map[string]file) {
 	m := map[string]file{
-		path.Join(root, "ab.txt"):       &testFile{key: path.Join(root, "ab.txt"), etag: `"7b0ded95031647702b8bed17dce7698a"`, size: int64(3)},
+		path.Join(root, "ab.txt"):       &testFile{key: path.Join(root, "ab.txt"), etag: `"b86fc6b051f63d73de262d4c34e3a0a9"`, size: int64(2)},
 		path.Join(root, "main.css"):     &testFile{key: path.Join(root, "main.css"), etag: `"changed"`, size: int64(27)},
 		path.Join(root, "deleteme.txt"): &testFile{},
 	}
@@ -235,7 +303,6 @@ func newTestStoreFrom(m map[string]file, failAt int) remoteStore {
 type testStore struct {
 	failAt int
 	m      map[string]file
-	remote map[string]file
 
 	sync.Mutex
 }
@@ -253,7 +320,7 @@ func assertKeys(t *testing.T, m map[string]file, keys ...string) {
 	}
 }
 
-func (s *testStore) FileMap(opts ...opOption) (map[string]file, error) {
+func (s *testStore) FileMap(ctx context.Context, opts ...opOption) (map[string]file, error) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -291,6 +358,6 @@ func (s *testStore) DeleteObjects(ctx context.Context, keys []string, opts ...op
 	return nil
 }
 
-func (s *testStore) Finalize() error {
+func (s *testStore) Finalize(ctx context.Context) error {
 	return nil
 }

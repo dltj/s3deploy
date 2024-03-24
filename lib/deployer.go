@@ -1,4 +1,4 @@
-// Copyright © 2018 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
+// Copyright © 2022 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
@@ -9,11 +9,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -21,8 +19,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/unicode/norm"
-
-	"gopkg.in/yaml.v2"
 )
 
 const up = `↑`
@@ -45,20 +41,14 @@ type Deployer struct {
 	store remoteStore
 }
 
-type upload struct {
-	*osFile
-	reason string
-}
-
 // Deploy deploys to the remote based on the given config.
 func Deploy(cfg *Config) (DeployStats, error) {
-	if err := cfg.check(); err != nil {
+	if err := cfg.Init(); err != nil {
 		return DeployStats{}, err
 	}
-
-	var outv, out io.Writer = ioutil.Discard, os.Stdout
+	var outv, out io.Writer = io.Discard, os.Stdout
 	if cfg.Silent {
-		out = ioutil.Discard
+		out = io.Discard
 	} else {
 		if cfg.Verbose {
 			outv = os.Stdout
@@ -74,28 +64,24 @@ func Deploy(cfg *Config) (DeployStats, error) {
 	g, ctx = errgroup.WithContext(ctx)
 	defer cancel()
 
-	var d = &Deployer{
+	d := &Deployer{
 		g:             g,
 		outv:          outv,
 		printer:       newPrinter(out),
 		filesToUpload: make(chan *osFile),
 		cfg:           cfg,
-		stats:         &DeployStats{}}
+		stats:         &DeployStats{},
+	}
 
 	numberOfWorkers := cfg.NumberOfWorkers
 	if numberOfWorkers <= 0 {
 		numberOfWorkers = runtime.NumCPU()
 	}
 
-	// load additional config from file if it exists
-	err := d.loadConfig()
-	if err != nil {
-		return *d.stats, fmt.Errorf("Failed to load config from %s: %s", cfg.ConfigFile, err)
-	}
-
 	baseStore := d.cfg.baseStore
 	if baseStore == nil {
-		baseStore, err = newRemoteStore(*d.cfg, d)
+		var err error
+		baseStore, err = newRemoteStore(d.cfg, d)
 		if err != nil {
 			return *d.stats, err
 		}
@@ -104,7 +90,7 @@ func Deploy(cfg *Config) (DeployStats, error) {
 		baseStore = newNoUpdateStore(baseStore)
 		d.Println("This is a trial run, with no remote updates.")
 	}
-	d.store = newStore(*d.cfg, baseStore)
+	d.store = newStore(d.cfg, baseStore)
 
 	for i := 0; i < numberOfWorkers; i++ {
 		g.Go(func() error {
@@ -112,7 +98,7 @@ func Deploy(cfg *Config) (DeployStats, error) {
 		})
 	}
 
-	err = d.plan(ctx)
+	err := d.plan(ctx)
 	if err != nil {
 		cancel()
 	}
@@ -134,7 +120,7 @@ func Deploy(cfg *Config) (DeployStats, error) {
 		withMaxDelete(d.cfg.MaxDelete))
 
 	if err == nil {
-		err = d.store.Finalize()
+		err = d.store.Finalize(context.Background())
 	}
 
 	return *d.stats, err
@@ -161,6 +147,10 @@ func (p print) Printf(format string, a ...interface{}) (n int, err error) {
 	return fmt.Fprintf(p.out, format, a...)
 }
 
+func (d *Deployer) printf(format string, a ...interface{}) {
+	fmt.Fprintf(d.outv, format, a...)
+}
+
 func (d *Deployer) enqueueUpload(ctx context.Context, f *osFile) {
 	d.Printf("%s (%s) %s ", f.relPath, f.reason, up)
 	select {
@@ -170,12 +160,12 @@ func (d *Deployer) enqueueUpload(ctx context.Context, f *osFile) {
 }
 
 func (d *Deployer) skipFile(f *osFile) {
-	fmt.Fprintf(d.outv, "%s skipping …\n", f.relPath)
+	d.printf("%s skipping …\n", f.relPath)
 	atomic.AddUint64(&d.stats.Skipped, uint64(1))
 }
 
 func (d *Deployer) enqueueDelete(key string) {
-	fmt.Fprintf(d.outv, "%s not found in source, deleting.\n", key)
+	d.printf("%s not found in source, deleting.\n", key)
 	d.filesToDelete = append(d.filesToDelete, key)
 }
 
@@ -190,10 +180,11 @@ const (
 
 // plan figures out which files need to be uploaded.
 func (d *Deployer) plan(ctx context.Context) error {
-	remoteFiles, err := d.store.FileMap()
+	remoteFiles, err := d.store.FileMap(ctx)
 	if err != nil {
 		return err
 	}
+	d.printf("Found %d remote files\n", len(remoteFiles))
 
 	// All local files at sourcePath
 	localFiles := make(chan *osFile)
@@ -233,7 +224,12 @@ func (d *Deployer) plan(ctx context.Context) error {
 	close(d.filesToUpload)
 
 	// any remote files not found locally should be removed:
+	// except for ignored files
 	for key := range remoteFiles {
+		if d.cfg.shouldIgnoreRemote(key) {
+			d.printf("%s ignored …\n", key)
+			continue
+		}
 		d.enqueueDelete(key)
 	}
 
@@ -277,9 +273,18 @@ func (d *Deployer) walk(ctx context.Context, basePath string, dotAllowlist []*st
 		if err != nil {
 			return err
 		}
-		f, err := newOSFile(d.cfg.conf.Routes, d.cfg.BucketPath, rel, abs, info)
+
+		if d.cfg.shouldIgnoreLocal(rel) {
+			return nil
+		}
+
+		f, err := newOSFile(d.cfg.fileConf.Routes, d.cfg.BucketPath, rel, abs, info)
 		if err != nil {
 			return err
+		}
+
+		if f.route != nil && f.route.Ignore {
+			return nil
 		}
 
 		select {
@@ -311,41 +316,4 @@ func (d *Deployer) upload(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-}
-
-func (d *Deployer) loadConfig() error {
-	configFile := d.cfg.ConfigFile
-
-	if configFile == "" {
-		return nil
-	}
-
-	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		return nil
-	}
-
-	data, err := ioutil.ReadFile(configFile)
-
-	if os.IsNotExist(err) {
-		return nil
-	}
-
-	conf := fileConfig{}
-
-	err = yaml.Unmarshal(data, &conf)
-	if err != nil {
-		return err
-	}
-
-	for _, r := range conf.Routes {
-		r.routerRE, err = regexp.Compile(r.Route)
-
-		if err != nil {
-			return err
-		}
-	}
-
-	d.cfg.conf = conf
-
-	return nil
 }

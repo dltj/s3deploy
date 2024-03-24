@@ -1,4 +1,4 @@
-// Copyright © 2018 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
+// Copyright © 2022 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
@@ -8,6 +8,7 @@ package lib
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -18,25 +19,25 @@ var (
 )
 
 type remoteStore interface {
-	FileMap(opts ...opOption) (map[string]file, error)
+	FileMap(ctx context.Context, opts ...opOption) (map[string]file, error)
 	Put(ctx context.Context, f localFile, opts ...opOption) error
 	DeleteObjects(ctx context.Context, keys []string, opts ...opOption) error
-	Finalize() error
+	Finalize(ctx context.Context) error
 }
 
 type remoteCDN interface {
-	InvalidateCDNCache(paths ...string) error
+	InvalidateCDNCache(ctx context.Context, paths ...string) error
 }
 
 type store struct {
-	cfg      Config
+	cfg      *Config
 	delegate remoteStore
 
 	changedKeys []string
 	changedMu   sync.Mutex
 }
 
-func newStore(cfg Config, s remoteStore) remoteStore {
+func newStore(cfg *Config, s remoteStore) remoteStore {
 	return &store{cfg: cfg, delegate: s}
 }
 
@@ -46,13 +47,13 @@ func (s *store) trackChanged(keys ...string) {
 	s.changedKeys = append(s.changedKeys, keys...)
 }
 
-func (s *store) FileMap(opts ...opOption) (map[string]file, error) {
-	return s.delegate.FileMap(opts...)
+func (s *store) FileMap(ctx context.Context, opts ...opOption) (map[string]file, error) {
+	return s.delegate.FileMap(ctx, opts...)
 }
 
-func (s *store) Finalize() error {
+func (s *store) Finalize(ctx context.Context) error {
 	if cdn, ok := s.delegate.(remoteCDN); ok {
-		return cdn.InvalidateCDNCache(s.changedKeys...)
+		return cdn.InvalidateCDNCache(ctx, s.changedKeys...)
 	}
 	return nil
 }
@@ -100,7 +101,6 @@ func (s *store) DeleteObjects(ctx context.Context, keys []string, opts ...opOpti
 		keyChunk := keyChunks[i]
 
 		err := s.delegate.DeleteObjects(ctx, keyChunk, opts...)
-
 		if err != nil {
 			return err
 		}
@@ -125,9 +125,9 @@ func newNoUpdateStore(base remoteStore) remoteStore {
 	return &noUpdateStore{readOps: base}
 }
 
-func (s *noUpdateStore) FileMap(opts ...opOption) (map[string]file, error) {
+func (s *noUpdateStore) FileMap(ctx context.Context, opts ...opOption) (map[string]file, error) {
 	if s.readOps != nil {
-		return s.readOps.FileMap(opts...)
+		return s.readOps.FileMap(ctx, opts...)
 	}
 	return make(map[string]file), nil
 }
@@ -140,17 +140,17 @@ func (s *noUpdateStore) DeleteObjects(ctx context.Context, keys []string, opts .
 	return nil
 }
 
-func (s *noUpdateStore) Finalize() error {
+func (s *noUpdateStore) Finalize(ctx context.Context) error {
 	if s.readOps != nil {
-		return s.readOps.Finalize()
+		return s.readOps.Finalize(ctx)
 	}
 	return nil
 }
 
-func (s *noUpdateStore) InvalidateCDNCache(paths ...string) error {
+func (s *noUpdateStore) InvalidateCDNCache(ctx context.Context, paths ...string) error {
+	sort.Strings(paths)
 	fmt.Println("\nInvalidate CDN:", paths)
 	return nil
-
 }
 
 type opConfig struct {

@@ -2,14 +2,13 @@ version: 2
 jobs:
   build:
     docker:
-      - image: bepsays/ci-goreleaser:1.14.3
+      - image: bepsays/ci-goreleaser:1.21900.20200
     working_directory: /src
     steps:
       - checkout
       - run:
             command: |
                 go mod download
-                goreleaser
 workflows:
   version: 2
   release:
@@ -18,6 +17,6 @@ workflows:
             context: org-global
             filters:
               tags:
-                only: /v[0-9]+(\.[0-9]+)*(-.*)*/
+                only: /disabled-v[0-9]+(\.[0-9]+)*(-.*)*/
               branches:
                 ignore: /.*/

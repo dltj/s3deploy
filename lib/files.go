@@ -1,4 +1,4 @@
-// Copyright © 2018 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
+// Copyright © 2022 Bjørn Erik Pedersen <bjorn.erik.pedersen@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime"
 	"net/http"
 	"os"
@@ -48,6 +47,8 @@ type localFile interface {
 	// Content returns the content to be stored remotely. If this file
 	// configured to be gzipped, then that is what you get.
 	Content() io.ReadSeeker
+
+	ContentType() string
 
 	Headers() map[string]string
 }
@@ -100,15 +101,17 @@ func (f *osFile) Size() int64 {
 	return f.size
 }
 
+func (f *osFile) ContentType() string {
+	return f.contentType
+}
+
 func (f *osFile) Content() io.ReadSeeker {
 	f.f.Seek(0, 0)
 	return f.f
 }
 
 func (f *osFile) Headers() map[string]string {
-	headers := map[string]string{
-		"Content-Type": f.contentType,
-	}
+	headers := map[string]string{}
 
 	if f.route != nil {
 		if f.route.Gzip {
@@ -160,7 +163,6 @@ func detectContentTypeFromContent(b []byte) string {
 	}
 
 	return http.DetectContentType(peek)
-
 }
 
 func (f *osFile) shouldThisReplace(other file) (bool, uploadReason) {
@@ -202,7 +204,7 @@ func newOSFile(routes routes, targetRoot, relPath, absPath string, fi os.FileInf
 		peek = make([]byte, 512)
 		file.Read(peek)
 	} else {
-		b, err := ioutil.ReadAll(file)
+		b, err := io.ReadAll(file)
 		if err != nil {
 			return nil, err
 		}
@@ -222,7 +224,6 @@ type routes []*route
 type filen []*string
 
 func (r routes) get(path string) *route {
-
 	for _, route := range r {
 		if route.routerRE.MatchString(path) {
 			return route
@@ -231,7 +232,6 @@ func (r routes) get(path string) *route {
 
 	// no route found
 	return nil
-
 }
 
 // read config from .s3deploy.yml if found.
@@ -244,12 +244,12 @@ type route struct {
 	Route   string            `yaml:"route"`
 	Headers map[string]string `yaml:"headers"`
 	Gzip    bool              `yaml:"gzip"`
+	Ignore  bool              `yaml:"ignore"`
 
 	routerRE *regexp.Regexp // compiled version of Route
 }
 
 func calculateETag(r io.Reader) (string, error) {
-
 	h := md5.New()
 
 	_, err := io.Copy(h, r)
